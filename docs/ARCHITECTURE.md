@@ -57,3 +57,9 @@ is `~/.local/bin/codex-managed` and the skill/protocol path is
 availability, PATH discovery, manifest hashes, and skill location. A `--root`
 installation is staging only and doctor marks it unusable. The installer does
 not write Codex configuration or system directories.
+
+The controller separately enforces the provider's absolute reported window
+utilization below 80% at reservation and launch time. Project caps continue to
+measure movement since the project's baseline. Managed launch snapshots carry
+forward only previously validated reconciled call coverage for the same reset
+window; the current call is never marked covered before factual reconciliation.

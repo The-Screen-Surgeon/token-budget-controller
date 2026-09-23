@@ -109,6 +109,10 @@ The gate uses the same validation for supplied and cached snapshots and fails
 closed on stale, expired, regressing, contradictory, or insufficient evidence.
 Window headroom includes factual consumption plus outstanding reservations that
 the snapshot does not cover, counted once.
+Every reservation and launch claim also checks the provider-reported absolute
+window percentage and stops at 80%, even when a project baseline was already
+above that threshold. Absolute current usage remains separate from project
+consumption since baseline.
 
 Reservations count against task, session, coordinator, and per-window limits.
 The 50% barrier tracks crossings for task tokens and every provider window; a

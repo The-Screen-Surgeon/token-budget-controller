@@ -93,6 +93,10 @@ class CodexAppServerAdapter:
         if by_id is not None:
             if not isinstance(by_id, dict) or any(not isinstance(k, str) or not isinstance(v, dict) for k, v in by_id.items()):
                 raise CodexUsageError("invalid rateLimitsByLimitId")
+            for key, bucket in by_id.items():
+                bucket_id = bucket.get("limitId")
+                if bucket_id is not None and bucket_id != key:
+                    raise CodexUsageError("rate limit bucket key and limitId disagree")
         if isinstance(by_id, dict) and by_id:
             rate = by_id.get("codex")
             if not isinstance(rate, dict):
@@ -105,6 +109,8 @@ class CodexAppServerAdapter:
                        "rateLimitReachedType"}
         if not isinstance(rate, dict) or not {"primary", "secondary"}.issubset(rate) or set(rate) - rate_fields:
             raise CodexUsageError("missing primary or secondary rate limit")
+        if rate.get("limitId") not in (None, "codex"):
+            raise CodexUsageError("selected Codex bucket has a conflicting limitId")
         for key in ("limitId", "limitName", "normalModelSlug", "planType", "rateLimitReachedType"):
             if key in rate and rate[key] is not None and not isinstance(rate[key], str):
                 raise CodexUsageError(f"invalid rate limit {key}")

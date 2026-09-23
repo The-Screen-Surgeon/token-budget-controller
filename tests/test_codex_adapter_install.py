@@ -12,6 +12,7 @@ from token_budget.codex_adapter import CodexAppServerAdapter, CodexUsageError
 from token_budget.managed_install import install, doctor, uninstall
 from token_budget.controller import Controller
 from token_budget.managed_codex import launch_managed_codex
+from token_budget.managed_codex import _controller_snapshots
 
 
 class FakeProcess:
@@ -69,6 +70,12 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertEqual((got["primary"]["used_percent"], got["secondary"]["used_percent"]), (12, 34))
         with self.assertRaises(CodexUsageError):
             CodexAppServerAdapter.validate_rate_limits({"rateLimitsByLimitId": {"other": result["rateLimitsByLimitId"]["other"]}}, now=1000)
+        for key, bucket in (("codex", {**result["rateLimitsByLimitId"]["codex"], "limitId": "other"}),
+                            ("other", result["rateLimitsByLimitId"]["codex"])):
+            with self.assertRaises(CodexUsageError):
+                CodexAppServerAdapter.validate_rate_limits({"rateLimitsByLimitId": {key: bucket}}, now=1000)
+        with self.assertRaises(CodexUsageError):
+            CodexAppServerAdapter.validate_rate_limits({"rateLimits": {**result["rateLimitsByLimitId"]["codex"], "limitId": "other"}}, now=1000)
 
     def test_timeout_and_missing_binary(self):
         class Blocking:
@@ -112,6 +119,72 @@ class CodexAdapterTests(unittest.TestCase):
             self.assertEqual(seen[0][0], ["codex", "--help"])
             controller.close()
 
+    def test_managed_conversion_preserves_only_reconciled_coverage_for_next_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = Controller(Path(tmp) / "controller.sqlite")
+            now = 1000
+            initial = {"primary": {"baseline_used_micropct": 10_000_000, "current_used_micropct": 10_000_000,
+                                   "reset_id": "p2", "resets_at": 2000},
+                       "secondary": {"baseline_used_micropct": 20_000_000, "current_used_micropct": 20_000_000,
+                                     "reset_id": "s2", "resets_at": 3000}}
+            windows = {name: {**v, "cap_micropct": 100_000_000, "observed_at": now, "covered_call_ids": []}
+                       for name, v in initial.items()}
+            controller.create_project("p", task_cap=1000, session_cap=1000,
+                coordinator_reserve=10, windows=windows, adapter="codex", now=now)
+            start = {name: {"current_used_micropct": v["current_used_micropct"], "reset_id": v["reset_id"],
+                            "resets_at": v["resets_at"], "observed_at": now, "covered_call_ids": []}
+                     for name, v in initial.items()}
+            controller.reserve_call("p", call_id="A", model="gpt", purpose="A", token_reservation=1,
+                window_reservations={"primary": 2_000_000, "secondary": 2_000_000}, snapshots=start, now=now)
+            controller.launch("p", "A", now=now)
+            after_a = {"primary": {**start["primary"], "current_used_micropct": 11_000_000, "observed_at": 1001, "covered_call_ids": ["A"]},
+                       "secondary": {**start["secondary"], "current_used_micropct": 21_000_000, "observed_at": 1001, "covered_call_ids": ["A"]}}
+            controller.reconcile("p", "A", actual_tokens=1,
+                actual_windows={"primary": 1_000_000, "secondary": 1_000_000}, snapshots=after_a, now=1001)
+            raw = {"observed_at": 1002, "windows": {
+                "primary": {"used_micropct": 11_000_000, "reset_id": "p2", "resets_at": 2000},
+                "secondary": {"used_micropct": 21_000_000, "reset_id": "s2", "resets_at": 3000}}}
+            converted = _controller_snapshots(raw, controller, "p")
+            self.assertEqual(converted["primary"]["covered_call_ids"], ["A"])
+            self.assertNotIn("B", converted["primary"]["covered_call_ids"])
+            class Adapter:
+                def snapshot(self): return raw
+            result = launch_managed_codex(controller, Adapter(), project_id="p", call_id="B",
+                model="gpt", purpose="B", token_reservation=1,
+                window_reservations={"primary": 2_000_000, "secondary": 2_000_000},
+                codex_args=["--help"], now=1002,
+                runner=lambda command, **kw: SimpleNamespace(returncode=0))
+            self.assertEqual(result["decision"], "LAUNCHED")
+            self.assertEqual(controller.db.execute("SELECT status FROM calls WHERE call_id='B'").fetchone()[0], "launched")
+            controller.close()
+
+    def test_absolute_provider_80_percent_stop_catches_high_baseline_and_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = Controller(Path(tmp) / "controller.sqlite")
+            now = 1000
+            def snap(value, observed=now):
+                return {"short": {"current_used_micropct": value, "reset_id": "r", "resets_at": 2000,
+                                  "observed_at": observed, "covered_call_ids": []}}
+            high = {"short": {"baseline_used_micropct": 85_000_000, "cap_micropct": 10_000_000,
+                               "current_used_micropct": 85_000_000, "reset_id": "r",
+                               "resets_at": 2000, "observed_at": now, "covered_call_ids": []}}
+            controller.create_project("high", task_cap=1000, session_cap=1000,
+                coordinator_reserve=10, windows=high, now=now)
+            denied = controller.reserve_call("high", call_id="denied", model="gpt", purpose="test",
+                token_reservation=1, window_reservations={"short": 1}, snapshots=snap(85_000_000), now=now)
+            self.assertEqual(denied["reason_code"], "ABSOLUTE_PROVIDER_80_PERCENT_STOP")
+            ordinary = {"short": {"baseline_used_micropct": 70_000_000, "cap_micropct": 20_000_000,
+                                  "current_used_micropct": 70_000_000, "reset_id": "r",
+                                  "resets_at": 2000, "observed_at": now, "covered_call_ids": []}}
+            controller.create_project("jump", task_cap=1000, session_cap=1000,
+                coordinator_reserve=10, windows=ordinary, now=now)
+            reserved = controller.reserve_call("jump", call_id="jump", model="gpt", purpose="test",
+                token_reservation=1, window_reservations={"short": 1}, snapshots=snap(70_000_000), now=now)
+            self.assertEqual(reserved["decision"], "ALLOW")
+            controller.refresh_snapshots("jump", snap(85_000_000), now=now + 1)
+            self.assertFalse(controller._claim_launch("jump", "jump", now=now + 1))
+            controller.close()
+
 
 class ManagedInstallTests(unittest.TestCase):
     def test_idempotent_dry_run_collision_and_owned_uninstall(self):
@@ -149,7 +222,8 @@ class ManagedInstallTests(unittest.TestCase):
             self.assertTrue(result["dry_run"])
             self.assertTrue(doctor(root)["installed"])
             uninstall(root)
-            self.assertFalse(root.exists())
+            self.assertFalse(doctor(root)["installed"])
+            self.assertFalse((root / "bin/codex-managed").exists())
 
     def test_launcher_collision_and_manifest_path_tampering_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -180,15 +254,92 @@ class ManagedInstallTests(unittest.TestCase):
                 launcher = home / ".local/bin/codex-managed"
                 skill = home / ".codex/skills/token-budget/SKILL.md"
                 self.assertTrue(launcher.is_file())
+                self.assertTrue(launcher.stat().st_mode & 0o111)
                 self.assertTrue(skill.is_file())
                 doctor_report = doctor()
                 self.assertTrue(doctor_report["installed"])
+                self.assertTrue(doctor_report["launcher_executable"])
+                self.assertTrue(doctor_report["skill_discoverable"])
                 self.assertEqual(Path(doctor_report["launcher_path"]), launcher)
                 self.assertEqual(Path(doctor_report["skill_path"]), skill)
                 self.assertFalse(doctor_report["usable"])  # isolated HOME is not on PATH
                 uninstall()
                 self.assertFalse(launcher.exists())
                 self.assertFalse(skill.exists())
+
+    def test_install_resumes_safe_partial_write_and_serializes_races(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "config"
+            import token_budget.managed_install as installer
+            original = installer._link_staged
+            interrupted = {"done": False}
+            def stop_after_stage(path, temp_name, data, mode=0o600):
+                original(path, temp_name, data, mode)
+                if not interrupted["done"]:
+                    interrupted["done"] = True
+                    raise OSError("simulated interruption")
+            with patch.object(installer, "_link_staged", side_effect=stop_after_stage):
+                with self.assertRaises(OSError): install(root)
+            self.assertTrue((root / ".token-budget-recovery.json").is_file())
+            install(root)
+            self.assertTrue(doctor(root)["installed"])
+            self.assertFalse((root / ".token-budget-recovery.json").exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "config"; outcomes = []; errors = []
+            def worker():
+                try: outcomes.append(install(root))
+                except Exception as exc: errors.append(exc)
+            threads = [threading.Thread(target=worker) for _ in range(4)]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join()
+            self.assertEqual(len(outcomes), 4)
+            self.assertEqual(errors, [])
+            self.assertTrue(doctor(root)["installed"])
+            removed = []; failures = []
+            def remove_worker():
+                try: removed.append(uninstall(root))
+                except RuntimeError as exc: failures.append(exc)
+            threads = [threading.Thread(target=remove_worker) for _ in range(2)]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join()
+            self.assertEqual(len(removed), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertFalse(doctor(root)["installed"])
+
+    def test_symlink_manifest_ancestor_and_manifest_hash_tampering_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "config"
+            outside = Path(tmp) / "outside"; outside.mkdir()
+            (root / "bin").parent.mkdir(parents=True)
+            (root / "bin").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(RuntimeError): install(root)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "config"; install(root)
+            manifest_path = root / ".token-budget-manifest.json"
+            manifest_path.unlink()
+            external = Path(tmp) / "external.json"
+            external.write_text("{}")
+            manifest_path.symlink_to(external)
+            with self.assertRaises(RuntimeError): uninstall(root)
+            self.assertEqual(external.read_text(), "{}")
+            self.assertTrue(doctor(root)["unsafe_paths"])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "config"; install(root)
+            manifest_path = root / ".token-budget-manifest.json"
+            original = json.loads(manifest_path.read_text())
+            for hashes in (dict(original["sha256"], **{"bin/codex-managed": ""}),
+                           {k: v for k, v in original["sha256"].items() if k != "bin/codex-managed"}):
+                manifest = dict(original); manifest["sha256"] = hashes
+                manifest_path.write_text(json.dumps(manifest))
+                with self.assertRaises(RuntimeError): uninstall(root)
+                self.assertTrue((root / "bin/codex-managed").exists())
+            launcher = root / "bin/codex-managed"
+            launcher.write_text("user replacement")
+            manifest = dict(original)
+            manifest["sha256"] = dict(original["sha256"], **{
+                "bin/codex-managed": __import__("hashlib").sha256(b"user replacement").hexdigest()})
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaises(RuntimeError): uninstall(root)
 
 
 if __name__ == "__main__": unittest.main()

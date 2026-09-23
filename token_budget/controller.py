@@ -324,6 +324,11 @@ class Controller:
             if snap is None: snap = self._cached_snapshot(w)
             current, _, covered_ids, error = self._validate_snapshot(w["name"], w, snap, now, p["freshness_seconds"])
             if error: return deny(error, "factual usage snapshot failed validation")
+            # Provider utilization is an absolute fact. Project-relative caps
+            # below apply only to movement since baseline and must not obscure
+            # an already-exhausted provider window.
+            if current >= 80_000_000:
+                return deny("ABSOLUTE_PROVIDER_80_PERCENT_STOP", "provider-reported window utilization is at least 80%")
             liability = self._window_liability(project_id, w, set(covered_ids))
             used = current - w["baseline"] + liability
             projected = used + amounts[w["name"]]
@@ -544,6 +549,8 @@ class Controller:
                     snap = self._cached_snapshot(w)
                     current, _, covered_ids, error = self._validate_snapshot(w["name"], w, snap, now, p["freshness_seconds"])
                     if error: reason = f"{w['name']} usage is no longer valid: {error}"; break
+                    if current >= 80_000_000:
+                        reason = f"{w['name']} absolute provider utilization is at least 80%"; break
                     liability = self._window_liability(project_id, w, set(covered_ids))
                     used = current - w["baseline"] + liability
                     key = f"window:{w['name']}:{w['reset_id']}"
