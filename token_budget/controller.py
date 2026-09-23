@@ -47,7 +47,7 @@ class GateDecision:
 
 class ControllerError(ValueError): pass
 
-SUPPORTED_ADAPTERS = {"static", "manual"}
+SUPPORTED_ADAPTERS = {"static", "manual", "codex"}
 
 
 def _json(value: Any) -> str: return json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -324,7 +324,12 @@ class Controller:
             if snap is None: snap = self._cached_snapshot(w)
             current, _, covered_ids, error = self._validate_snapshot(w["name"], w, snap, now, p["freshness_seconds"])
             if error: return deny(error, "factual usage snapshot failed validation")
+            # Provider utilization is an absolute fact. Project-relative caps
+            # below apply only to movement since baseline and must not obscure
+            # an already-exhausted provider window.
             liability = self._window_liability(project_id, w, set(covered_ids))
+            if current + liability + amounts[w["name"]] >= 80_000_000:
+                return deny("ABSOLUTE_PROVIDER_80_PERCENT_STOP", "provider utilization plus liabilities would reach 80%")
             used = current - w["baseline"] + liability
             projected = used + amounts[w["name"]]
             key = f"window:{w['name']}:{w['reset_id']}"
@@ -545,6 +550,8 @@ class Controller:
                     current, _, covered_ids, error = self._validate_snapshot(w["name"], w, snap, now, p["freshness_seconds"])
                     if error: reason = f"{w['name']} usage is no longer valid: {error}"; break
                     liability = self._window_liability(project_id, w, set(covered_ids))
+                    if current + liability >= 80_000_000:
+                        reason = f"{w['name']} absolute provider utilization plus liabilities is at least 80%"; break
                     used = current - w["baseline"] + liability
                     key = f"window:{w['name']}:{w['reset_id']}"
                     state = self.db.execute("SELECT crossed,acknowledged,crossing_call_id FROM barrier_state WHERE project_id=? AND budget_key=?", (project_id, key)).fetchone()

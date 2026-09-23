@@ -2,6 +2,9 @@ from __future__ import annotations
 import argparse, json
 from pathlib import Path
 from .adapters import codex_events, claude_events
+from .codex_adapter import CodexAppServerAdapter, CodexUsageError
+from .managed_install import install as managed_install, doctor as managed_doctor, uninstall as managed_uninstall
+from .managed_codex import launch_managed_codex
 from .core import Ledger
 from .policy import evaluate_policy
 from .workflow import plan_project, build_receipt
@@ -36,6 +39,12 @@ def main(argv=None) -> int:
     export.add_argument("project_id")
     wrapper = sub.add_parser("exec", help="run a subprocess after the managed gate")
     wrapper.add_argument("--input", type=Path, required=True, help="JSON gate input; command is its command field")
+    codex = sub.add_parser("codex-managed", help="launch Codex CLI through the controller gate; outside calls remain unmanaged")
+    codex.add_argument("--input", type=Path, required=True, help="JSON containing project_id, call metadata, reservations, and codex_args")
+    for name in ("install", "doctor", "uninstall"):
+        cmd = sub.add_parser(f"managed-{name}", help=f"{name} user-scoped Token Budget files")
+        cmd.add_argument("--root", type=Path)
+        cmd.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv); ledger = Ledger(args.db)
     try:
         if args.command == "ingest":
@@ -89,6 +98,24 @@ def main(argv=None) -> int:
         elif args.command == "export-receipt":
             controller = Controller(args.db)
             try: print(json.dumps(controller.receipt(args.project_id), sort_keys=True))
+            finally: controller.close()
+        elif args.command in {"managed-install", "managed-doctor", "managed-uninstall"}:
+            fn = {"managed-install": managed_install, "managed-doctor": managed_doctor,
+                  "managed-uninstall": managed_uninstall}[args.command]
+            options = {"root": args.root}
+            if args.command != "managed-doctor": options["dry_run"] = args.dry_run
+            print(json.dumps(fn(**options), sort_keys=True))
+        elif args.command == "codex-managed":
+            data = json.loads(args.input.read_text())
+            argsv = data.get("codex_args")
+            if not isinstance(argsv, list) or any(not isinstance(x, str) for x in argsv):
+                raise ValueError("codex_args must be an array of strings")
+            adapter = CodexAppServerAdapter()
+            controller = Controller(args.db)
+            try:
+                call_data = {k: v for k, v in data.items() if k != "codex_args"}
+                result = launch_managed_codex(controller, adapter, **call_data, codex_args=argsv)
+                print(json.dumps(result, sort_keys=True))
             finally: controller.close()
     finally: ledger.close()
     return 0
