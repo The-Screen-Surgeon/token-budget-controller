@@ -58,9 +58,28 @@ deterministic seconds until both resets.
 Any model entry marked `partial` makes the aggregate partial; final usage
 snapshots use the plan's freshness limit.
 
-The installed `token-budget-collector.timer` refreshes the local ledger every
-minute. See [DESIGN.md](DESIGN.md) and [docs/PRIVACY.md](docs/PRIVACY.md) for
-claims and boundaries.
+The optional user-scoped installer provides a managed Codex CLI launcher. It
+does not intercept Codex UI or ordinary Codex CLI invocations. Calls made
+outside `codex-managed` remain unmanaged. Its live adapter reads Codex app-server
+account limits and aggregate account activity without making a model call;
+post-call reconciliation remains pending without factual per-call usage.
+
+```bash
+token-budget managed-install [--dry-run]
+token-budget managed-doctor
+token-budget managed-uninstall [--dry-run]
+token-budget codex-managed --input managed-codex-call.json
+```
+
+By default the installer puts `codex-managed` in `~/.local/bin` and the skill
+plus protocol in `~/.codex/skills/token-budget`; its ownership manifest lives in
+the user's Token Budget configuration directory. Add `~/.local/bin` to `PATH`
+and install Token Budget into the launcher's Python environment. `managed-doctor`
+checks Python/package import, Codex CLI, hashes, PATH discovery, skill location,
+and reports whether the install is usable. `--root DIR` creates an isolated
+staging install that doctor intentionally marks unusable. Install and uninstall
+refuse collisions or modified owned files. See [DESIGN.md](DESIGN.md) and
+[docs/PRIVACY.md](docs/PRIVACY.md) for boundaries.
 
 ## Verify
 
@@ -123,13 +142,17 @@ python3 -m token_budget.cli --db budget.sqlite exec --input wrapped-command.json
 after `ALLOW` and claims that call's reservation atomically. Calls made outside
 this wrapper are outside technical enforcement. Receipts report available
 tokens after outstanding reservations and task/session/80% limits, and preserve
-per-window actuals and overruns individually. The MVP includes only static and
-manual snapshot inputs. Provider-specific Codex, Claude, Hermes, OpenClaw, and
-Grok adapters, installer, and release packaging remain roadmap work.
+per-window actuals and overruns individually. The MVP includes static/manual
+snapshots and a read-only live Codex account snapshot adapter. Codex support
+requires both primary and secondary percentages and valid reset metadata; the
+adapter does not provide factual per-call tokens. Claude, Hermes, OpenClaw, and
+Grok live adapters, system-wide installation, transparent interception, and
+release packaging remain unsupported.
 
 Earlier ledger and workflow components received scoped GPT-6 Astra clearance.
 After correction of four additional state-machine defects, the final scoped
 controller review returned CLEAR and independently passed all 30 packaged
 controller tests. This clearance covers the managed-wrapper controller and its
-static/manual snapshot boundary; provider integrations remain roadmap work. See
+static/manual snapshot boundary; the Codex adapter and installer have not
+received that review. See
 [the roadmap](docs/ROADMAP.md).

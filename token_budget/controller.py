@@ -47,7 +47,7 @@ class GateDecision:
 
 class ControllerError(ValueError): pass
 
-SUPPORTED_ADAPTERS = {"static", "manual"}
+SUPPORTED_ADAPTERS = {"static", "manual", "codex"}
 
 
 def _json(value: Any) -> str: return json.dumps(value, sort_keys=True, separators=(",", ":"))
