@@ -1,0 +1,1 @@
+{"type":"assistant","uuid":"abc","sessionId":"session-1","timestamp":"2026-09-22T10:01:00Z","message":{"model":"claude-test","role":"assistant","usage":{"input_tokens":7,"output_tokens":3,"cache_read_input_tokens":2,"cache_creation_input_tokens":4},"content":[{"type":"text","text":"secret must not be stored"}]}}
