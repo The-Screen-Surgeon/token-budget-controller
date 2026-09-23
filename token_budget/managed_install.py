@@ -231,6 +231,22 @@ def _unlink_temp(path: Path, temp_name: str) -> None:
     finally: os.close(fd)
 
 
+def _capture_for_removal(path: Path, quarantine_name: str) -> None:
+    """Atomically move a pathname into this transaction's private name."""
+    fd = _dirfd(path.parent, create=False)
+    if fd is None: raise RuntimeError(f"managed directory disappeared: {path.parent}")
+    try:
+        try:
+            os.stat(quarantine_name, dir_fd=fd, follow_symlinks=False)
+            raise RuntimeError(f"uninstall quarantine already exists: {path.parent / quarantine_name}")
+        except FileNotFoundError:
+            pass
+        try: os.rename(path.name, quarantine_name, src_dir_fd=fd, dst_dir_fd=fd)
+        except FileNotFoundError as exc: raise RuntimeError(f"managed file disappeared during uninstall: {path}") from exc
+        os.fsync(fd)
+    finally: os.close(fd)
+
+
 def _unlink(path: Path) -> None:
     fd = _dirfd(path.parent, create=False)
     if fd is None: return
@@ -469,8 +485,32 @@ def uninstall(root: Path | None = None, *, dry_run: bool = False) -> dict:
             if raw is not None and hashlib.sha256(raw).hexdigest() != hashes[rel]:
                 raise RuntimeError(f"refusing to remove modified managed file: {destinations[rel]}")
         if dry_run: return {"action": "uninstall", "root": str(target), "removed": expected["files"], "dry_run": True}
-        if recovery is None: _write_new(target / RECOVERY_NAME, _recovery_record(expected, "uninstall"), 0o600)
-        for rel in expected["files"]: _unlink(destinations[rel])
+        if recovery is None:
+            recovery_raw = _recovery_record(expected, "uninstall")
+            _write_new(target / RECOVERY_NAME, recovery_raw, 0o600)
+            recovery = _manifest(recovery_raw, expected, recovery=True)
+            assert recovery is not None
+        for rel in expected["files"]:
+            path = destinations[rel]
+            quarantine_name = recovery["staged"].get(rel)
+            if quarantine_name is None:
+                quarantine_name = f".tb-{uuid.uuid4().hex}.tmp"
+                recovery = _recovery_update(target / RECOVERY_NAME, recovery,
+                    lambda d, r=rel, n=quarantine_name: d["staged"].__setitem__(r, n))
+            quarantine = path.parent / quarantine_name
+            if rel not in recovery["completed"]:
+                if _read_at(path.parent, quarantine_name) is None:
+                    _capture_for_removal(path, quarantine_name)
+                captured = _read_at(path.parent, quarantine_name)
+                if captured is None or hashlib.sha256(captured).hexdigest() != hashes[rel]:
+                    raise RuntimeError(f"refusing to remove unowned captured file: {quarantine}")
+                recovery = _recovery_update(target / RECOVERY_NAME, recovery,
+                    lambda d, r=rel: d["completed"].append(r))
+            captured = _read_at(path.parent, quarantine_name)
+            if captured is not None:
+                if hashlib.sha256(captured).hexdigest() != hashes[rel]:
+                    raise RuntimeError(f"refusing to remove modified quarantine file: {quarantine}")
+                _unlink_temp(path, quarantine_name)
         _unlink(target / MANIFEST_NAME)
         _unlink(target / RECOVERY_NAME)
         return {"action": "uninstall", "root": str(target), "removed": expected["files"], "dry_run": False}

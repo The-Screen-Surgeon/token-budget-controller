@@ -183,6 +183,27 @@ class CodexAdapterTests(unittest.TestCase):
             self.assertEqual(reserved["decision"], "ALLOW")
             controller.refresh_snapshots("jump", snap(85_000_000), now=now + 1)
             self.assertFalse(controller._claim_launch("jump", "jump", now=now + 1))
+            near = {"short": {"baseline_used_micropct": 79_000_000, "cap_micropct": 10_000_000,
+                               "current_used_micropct": 79_000_000, "reset_id": "r",
+                               "resets_at": 2000, "observed_at": now, "covered_call_ids": []}}
+            controller.create_project("near", task_cap=1000, session_cap=1000,
+                coordinator_reserve=10, windows=near, now=now)
+            denied = controller.reserve_call("near", call_id="cross", model="gpt", purpose="test",
+                token_reservation=1, window_reservations={"short": 1_000_000}, snapshots=snap(79_000_000), now=now)
+            self.assertEqual(denied["reason_code"], "ABSOLUTE_PROVIDER_80_PERCENT_STOP")
+            multi = {"short": {"baseline_used_micropct": 78_000_000, "cap_micropct": 10_000_000,
+                                "current_used_micropct": 78_000_000, "reset_id": "r",
+                                "resets_at": 2000, "observed_at": now, "covered_call_ids": []}}
+            controller.create_project("multi", task_cap=1000, session_cap=1000,
+                coordinator_reserve=10, windows=multi, now=now)
+            allowed = controller.reserve_call("multi", call_id="first", model="gpt", purpose="test",
+                token_reservation=1, window_reservations={"short": 500_000}, snapshots=snap(78_000_000), now=now)
+            self.assertEqual(allowed["decision"], "ALLOW")
+            denied = controller.reserve_call("multi", call_id="second", model="gpt", purpose="test",
+                token_reservation=1, window_reservations={"short": 1_500_000}, snapshots=snap(78_000_000), now=now)
+            self.assertEqual(denied["reason_code"], "ABSOLUTE_PROVIDER_80_PERCENT_STOP")
+            controller.refresh_snapshots("multi", snap(79_500_000), now=now + 1)
+            self.assertFalse(controller._claim_launch("multi", "first", now=now + 1))
             controller.close()
 
 
@@ -340,6 +361,22 @@ class ManagedInstallTests(unittest.TestCase):
                 "bin/codex-managed": __import__("hashlib").sha256(b"user replacement").hexdigest()})
             manifest_path.write_text(json.dumps(manifest))
             with self.assertRaises(RuntimeError): uninstall(root)
+
+    def test_uninstall_preserves_replacement_created_after_atomic_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "config"; install(root)
+            launcher = root / "bin/codex-managed"
+            import token_budget.managed_install as installer
+            original = installer._capture_for_removal
+            replaced = {"done": False}
+            def replace_after_capture(path, quarantine_name):
+                original(path, quarantine_name)
+                if path == launcher and not replaced["done"]:
+                    replaced["done"] = True
+                    path.write_text("user replacement")
+            with patch.object(installer, "_capture_for_removal", side_effect=replace_after_capture):
+                uninstall(root)
+            self.assertEqual(launcher.read_text(), "user replacement")
 
 
 if __name__ == "__main__": unittest.main()
